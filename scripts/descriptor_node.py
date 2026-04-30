@@ -47,7 +47,7 @@ class DescriptorNode:
             kp = cv2.KeyPoint(
                 x=kp_msg.x[i],
                 y=kp_msg.y[i],
-                _size=kp_msg.size[i]
+                size=kp_msg.size[i]
             )
             keypoints.append(kp)
 
