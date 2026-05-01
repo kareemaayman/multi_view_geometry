@@ -1,140 +1,121 @@
 #!/usr/bin/env python3
+"""
+=============================================================
+ Node 7 — Motion Estimation Node  (Student 2)
+=============================================================
+Responsibility:
+  Estimate the relative camera motion direction from the
+  geometric inlier correspondences. Since the camera is
+  monocular, only direction — not metric scale — is inferred.
 
+Topics Subscribed:
+  /geometric_inliers  (multi_view_geometry/GeometricInliers)
+
+Topics Published:
+  /camera_motion  (multi_view_geometry/CameraMotion)
+
+Parameters:
+  ~focal_length : approx. focal length in pixels [default: 500]
+
+Internal Logic:
+  1. Compute mean optical flow vector (dx, dy) from inliers
+  2. Horizontal direction:
+       dx >  motion_thr → 'right'
+       dx < -motion_thr → 'left'
+       else             → 'none'
+  3. Depth direction via spread change (divergence analysis):
+       spread increases → features moving away from centre
+                        → camera moving FORWARD
+       spread decreases → features moving toward centre
+                        → camera moving BACKWARD
+  4. Scale ambiguity is always True for monocular systems.
+
+ROS1 vs ROS2:
+  ROS1: rospy.Subscriber, msg.header.stamp with rospy.Time
+  ROS2: create_subscription, rclpy.time.Time
+=============================================================
+"""
 import rospy
-from std_msgs.msg import String
-from std_msgs.msg import Header
-
-# Custom messages
-from multi_view_geometry.msg import GeometricInliers
-from multi_view_geometry.msg import CameraMotion   # ✅ your required message
+import numpy as np
+from multi_view_geometry.msg import GeometricInliers, CameraMotion
 
 
 class MotionEstimationNode:
-
     def __init__(self):
-        rospy.init_node('motion_node', anonymous=True)
+        rospy.init_node('motion_node', anonymous=False)
 
-        # Parameter (required)
-        self.focal_length = rospy.get_param('~focal_length', 525.0)
+        self.focal_length    = rospy.get_param('~focal_length', 500.0)
+        self.motion_thr      = rospy.get_param('~motion_threshold', 2.0)
+        self.spread_thr      = rospy.get_param('~spread_threshold', 1.0)
 
-        # Subscriber
-        rospy.Subscriber('/geometric_inliers', GeometricInliers, self.callback)
+        self.pub = rospy.Publisher('/camera_motion', CameraMotion, queue_size=10)
+        rospy.Subscriber('/geometric_inliers', GeometricInliers,
+                         self.callback, queue_size=5)
 
-        # Publishers
-        self.motion_pub = rospy.Publisher('/camera_motion', CameraMotion, queue_size=10)
-        self.state_pub = rospy.Publisher('/system_state', String, queue_size=10)
+        rospy.loginfo("[Motion] Started | focal_length=%.1f px", self.focal_length)
+        rospy.spin()
 
-        rospy.loginfo("Motion Estimation Node Started")
+    def callback(self, inlier_msg):
+        msg        = CameraMotion()
+        msg.header = inlier_msg.header
 
-
-    def callback(self, msg):
-
-        n = len(msg.query_x)
-
-        # ⚠️ FAILURE CONDITIONS (system rules)
-        if n < 20:
-            self.publish_failure("LOW_FEATURES")
+        # ── Not enough inliers to estimate motion ─────────────────────────
+        if inlier_msg.inlier_count < 4:
+            msg.direction_horizontal = 'unknown'
+            msg.direction_depth      = 'unknown'
+            msg.translation_x        = 0.0
+            msg.translation_y        = 0.0
+            msg.magnitude            = 0.0
+            msg.scale_ambiguous      = True
+            self.pub.publish(msg)
             return
 
-        dx_total = 0.0
-        dy_total = 0.0
+        q_x = np.array(inlier_msg.query_x, dtype=np.float32)
+        q_y = np.array(inlier_msg.query_y, dtype=np.float32)
+        t_x = np.array(inlier_msg.train_x, dtype=np.float32)
+        t_y = np.array(inlier_msg.train_y, dtype=np.float32)
 
-        for i in range(n):
+        # ── Mean optical flow ─────────────────────────────────────────────
+        dx = float(np.mean(t_x - q_x))
+        dy = float(np.mean(t_y - q_y))
 
-            x1 = msg.query_x[i]
-            y1 = msg.query_y[i]
-
-            x2 = msg.train_x[i]
-            y2 = msg.train_y[i]
-
-            dx_total += (x2 - x1)
-            dy_total += (y2 - y1)
-
-        # Average optical flow
-        avg_dx = dx_total / n
-        avg_dy = dy_total / n
-
-        magnitude = (avg_dx**2 + avg_dy**2) ** 0.5
-
-        # Direction estimation
-        dir_h, dir_d = self.estimate_direction(avg_dx, avg_dy)
-
-        # Always monocular
-        scale_ambiguous = True
-
-        # Build message
-        motion_msg = CameraMotion()
-
-        motion_msg.header = Header()
-        motion_msg.header.stamp = rospy.Time.now()
-
-        motion_msg.direction_horizontal = dir_h
-        motion_msg.direction_depth = dir_d
-
-        motion_msg.translation_x = avg_dx
-        motion_msg.translation_y = avg_dy
-        motion_msg.magnitude = magnitude
-        motion_msg.scale_ambiguous = scale_ambiguous
-
-        # Publish
-        self.motion_pub.publish(motion_msg)
-
-        rospy.loginfo(
-            f"[Motion] dx={avg_dx:.2f}, dy={avg_dy:.2f}, mag={magnitude:.2f}, "
-            f"H={dir_h}, D={dir_d}"
-        )
-
-
-    def estimate_direction(self, dx, dy):
-
-        threshold = 1.0
-
-        # Horizontal motion
-        if abs(dx) > threshold:
-            if dx > 0:
-                direction_horizontal = "RIGHT"
-            else:
-                direction_horizontal = "LEFT"
+        # ── Horizontal direction (left / right) ───────────────────────────
+        if abs(dx) > self.motion_thr:
+            h_dir = 'right' if dx > 0 else 'left'
         else:
-            direction_horizontal = "NONE"
+            h_dir = 'none'
 
-        # Depth motion (approx from vertical flow)
-        if abs(dy) > threshold:
-            if dy < 0:
-                direction_depth = "FORWARD"
-            else:
-                direction_depth = "BACKWARD"
+        # ── Depth direction (forward / backward) via spread divergence ────
+        #    Centroid of previous & current point sets
+        q_cx, q_cy = float(np.mean(q_x)), float(np.mean(q_y))
+        t_cx, t_cy = float(np.mean(t_x)), float(np.mean(t_y))
+
+        #    Mean distance from centroid (spread)
+        q_spread = float(np.mean(np.sqrt((q_x - q_cx)**2 + (q_y - q_cy)**2)))
+        t_spread = float(np.mean(np.sqrt((t_x - t_cx)**2 + (t_y - t_cy)**2)))
+        d_spread = t_spread - q_spread  # positive → diverging → forward
+
+        if abs(d_spread) > self.spread_thr:
+            v_dir = 'forward' if d_spread > 0 else 'backward'
         else:
-            direction_depth = "NONE"
+            v_dir = 'none'
 
-        return direction_horizontal, direction_depth
+        # ── Magnitude ─────────────────────────────────────────────────────
+        magnitude = float(np.sqrt(dx**2 + dy**2))
 
+        msg.direction_horizontal = h_dir
+        msg.direction_depth      = v_dir
+        msg.translation_x        = dx
+        msg.translation_y        = dy
+        msg.magnitude            = magnitude
+        msg.scale_ambiguous      = True   # always true for monocular
 
-    def publish_failure(self, reason):
+        rospy.loginfo("[Motion] horizontal=%-6s  depth=%-9s  mag=%.2f px  "
+                      "spread_delta=%.2f",
+                      h_dir, v_dir, magnitude, d_spread)
 
-        rospy.logwarn(f"[Motion] FAILURE: {reason}")
-
-        # system state
-        self.state_pub.publish("UNRELIABLE")
-
-        # still publish motion message but marked unknown
-        motion_msg = CameraMotion()
-        motion_msg.header = Header()
-        motion_msg.header.stamp = rospy.Time.now()
-
-        motion_msg.direction_horizontal = "UNKNOWN"
-        motion_msg.direction_depth = "UNKNOWN"
-        motion_msg.translation_x = 0.0
-        motion_msg.translation_y = 0.0
-        motion_msg.magnitude = 0.0
-        motion_msg.scale_ambiguous = True
-
-        self.motion_pub.publish(motion_msg)
+        self.pub.publish(msg)
 
 
 if __name__ == '__main__':
-    try:
-        MotionEstimationNode()
-        rospy.spin()
-    except rospy.ROSInterruptException:
-        pass
+    MotionEstimationNode()
